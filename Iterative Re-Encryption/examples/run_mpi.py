@@ -1,0 +1,174 @@
+import argparse
+import os
+import time
+import warnings
+import random
+from mpi4py import MPI
+from omegaconf import OmegaConf
+from appfl.agent import ClientAgent, ServerAgent
+from appfl.comm.mpi import MPIClientCommunicator, MPIServerCommunicator
+
+# TODO :D import crypto libraries
+import tenseal as ts
+
+
+def create_ckks_context():  # TODO :D Create CKKS context
+    new_context = ts.context(ts.SCHEME_TYPE.CKKS, 8192, coeff_mod_bit_sizes=[31, 26, 26, 26, 26, 26, 26, 31])
+    new_context.global_scale = pow(2, 26)
+    new_context.generate_relin_keys()
+    new_context.data.auto_rescale = True
+    new_context.data.auto_relin = True
+    new_context.data.auto_mod_switch = True
+    return new_context
+
+
+ckks_context = create_ckks_context()
+
+serialized_context = ckks_context.serialize(save_secret_key=True)
+
+with open('CKKS_keys_and_context.txt',
+          'wb') as f:  # TODO :D Serialize and save all keys and the context to a single file
+    f.write(serialized_context)
+
+with open('metrics_log.txt', 'w') as file:
+    pass  # The file is now empty
+
+try:
+    os.remove('latest_updated_global_model.pkl')
+    print(f"File 'latest_updated_global_model.pkl' has been deleted.")
+except FileNotFoundError:
+    print(f"File 'latest_updated_global_model.pkl' does not exist.")
+
+# TODO ignore warning
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.load.*weights_only=False.*")
+
+
+argparse = argparse.ArgumentParser()
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+argparse.add_argument(
+    "--server_config",
+    type=str,
+    default="./resources/configs/cifar10/server_fedasync.yaml",
+)
+argparse.add_argument(
+    "--client_config", type=str, default="./resources/configs/cifar10/client_1.yaml"
+)
+args = argparse.parse_args()
+
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
+num_clients = size - 1
+
+random.seed(70)
+
+if rank == 0:
+    # Load and set the server configurations
+    server_agent_config = OmegaConf.load(args.server_config)
+    server_agent_config.server_configs.scheduler_kwargs.num_clients = num_clients
+    if hasattr(server_agent_config.server_configs.aggregator_kwargs, "num_clients"):
+        server_agent_config.server_configs.aggregator_kwargs.num_clients = num_clients
+    # Create the server agent and communicator
+    server_agent = ServerAgent(server_agent_config=server_agent_config)
+    server_communicator = MPIServerCommunicator(
+        comm, server_agent, logger=server_agent.logger
+    )
+
+    # TODO timing the FL
+    start_serve = time.perf_counter()
+
+    # Start the server to serve the clients
+    server_communicator.serve()
+
+    total_serve_time = time.perf_counter() - start_serve
+    with open('serving_time_FL_log.txt', 'a') as f:
+        f.write(f"Total serve time: {total_serve_time:.4f}s\n")
+else:
+    # Set the client configurations
+    client_agent_config = OmegaConf.load(args.client_config)
+    client_agent_config.train_configs.logging_id = f"Client{rank}"
+    client_agent_config.data_configs.dataset_kwargs.num_clients = num_clients
+    client_agent_config.data_configs.dataset_kwargs.client_id = rank - 1
+    client_agent_config.data_configs.dataset_kwargs.visualization = (
+        True if rank == 1 else False
+    )
+    # Create the client agent and communicator
+    client_agent = ClientAgent(client_agent_config=client_agent_config)
+    client_communicator = MPIClientCommunicator(comm, server_rank=0)
+    # Load the configurations and initial global model
+    client_config = client_communicator.get_configuration()
+    client_agent.load_config(client_config)
+    init_global_model = client_communicator.get_global_model(init_model=True)
+    client_agent.load_initial_parameters(
+        init_global_model)  # TODO :D replace load_parameters by load_initial_parameters
+    # Send the sample size to the server
+    sample_size = client_agent.get_sample_size()
+    client_communicator.invoke_custom_action(
+        action="set_sample_size", sample_size=sample_size
+    )
+    # Generate data readiness report
+    if (
+        hasattr(client_config, "data_readiness_configs")
+        and hasattr(client_config.data_readiness_configs, "generate_dr_report")
+        and client_config.data_readiness_configs.generate_dr_report
+    ):
+        data_readiness = client_agent.generate_readiness_report(client_config)
+        client_communicator.invoke_custom_action(
+            action="get_data_readiness_report", **data_readiness
+        )
+
+    round_num = 0
+    # TODO seed randomizer depending on rank
+    random.seed(rank)
+
+    # Local training and global model update iterations
+    while True:
+        round_num += 1  # Increment round number (add this variable initialization before the loop)
+
+        # TODO introduce RANDOM DELAYS
+        delay = random.uniform(0, 50)
+        time.sleep(delay)
+
+        # Training time
+        start_train = time.perf_counter()
+        client_agent.train()
+        train_time = time.perf_counter() - start_train
+
+        # Get local model parameters (may include encryption)
+        start_encrypt_serialize = time.perf_counter()
+        local_model = client_agent.get_parameters()
+
+        if round_num == 1:
+            local_model, metadata = local_model[0], local_model[1]
+        else:
+            local_model, metadata = local_model[0], {}
+
+        '''
+        if isinstance(local_model, tuple):
+            local_model, metadata = local_model[0], local_model[1]
+        else:
+            metadata = {}
+        '''
+        encrypt_serialize_time = time.perf_counter() - start_encrypt_serialize  # Includes send time, adjust if needed
+
+        new_global_model, metadata = client_communicator.update_global_model(
+            local_model, **metadata
+        )
+        if metadata["status"] == "DONE":
+            break
+        if "local_steps" in metadata:
+            client_agent.trainer.train_configs.num_local_steps = metadata["local_steps"]
+
+        # Decrypt and deserialize global model
+        start_decrypt_deserialize = time.perf_counter()
+        client_agent.load_parameters(new_global_model)
+        decrypt_deserialize_time = time.perf_counter() - start_decrypt_deserialize
+
+        # Log computational times (example: to a file per client)
+        with open(f'client_{rank}_log.txt', 'a') as f:
+            f.write(
+                f"Round: {round_num}, Train time: {train_time:.4f}s, Encrypt+Serialize time: {encrypt_serialize_time:.4f}s, Decrypt+Deserialize time: {decrypt_deserialize_time:.4f}s\n")
+
+    client_communicator.invoke_custom_action(action="close_connection")
